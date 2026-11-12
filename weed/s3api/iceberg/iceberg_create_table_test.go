@@ -94,10 +94,20 @@ func TestNewTableMetadataAcceptsV3TypeAtV3(t *testing.T) {
 // A LoadTable response must never carry nil metadata: it serializes as
 // "metadata":null under HTTP 200, which no Iceberg client can parse.
 func TestBuildLoadTableResultNeverReturnsNilMetadata(t *testing.T) {
+	// A table stored with its location alone is served from the file there
+	// (TestRegisteredTableLoadsWithItsMetadata); when that cannot be read the
+	// load fails rather than serving an empty table.
+	r := httptest.NewRequest(http.MethodGet, "/v1/namespaces/ns/tables/t", nil)
+	if _, err := (&Server{filerClient: newMemFiler()}).buildLoadTableResult(r, s3tables.GetTableResponse{MetadataLocation: "s3://bkt/ns/t/metadata/v1.metadata.json"}, "bkt", []string{"ns"}, "t"); err == nil {
+		t.Error("a location whose metadata cannot be read: want an error, not an empty table")
+	}
+	// stored metadata that does not parse fails the load rather than serving an empty table
+	if _, err := (&Server{filerClient: newMemFiler()}).buildLoadTableResult(r, s3tables.GetTableResponse{Metadata: &s3tables.TableMetadata{FullMetadata: json.RawMessage(`{"nope":`)}}, "bkt", []string{"ns"}, "t"); err == nil {
+		t.Error("unparseable stored metadata: want an error, not an empty table")
+	}
 	cases := map[string]s3tables.GetTableResponse{
-		"no stored metadata":   {MetadataLocation: "s3://bkt/ns/t/metadata/v1.metadata.json"},
-		"empty full metadata":  {Metadata: &s3tables.TableMetadata{}},
-		"unparseable metadata": {Metadata: &s3tables.TableMetadata{FullMetadata: json.RawMessage(`{"nope":`)}},
+		"empty full metadata": {Metadata: &s3tables.TableMetadata{}},
+		"no location":         {},
 	}
 	for name, getResp := range cases {
 		t.Run(name, func(t *testing.T) {

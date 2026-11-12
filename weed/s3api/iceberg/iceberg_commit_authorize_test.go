@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"encoding/json"
+	"github.com/google/uuid"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -47,8 +48,11 @@ func seedOwnedTable(fc *memFiler, bucket, namespace, tableName, owner string) {
 		"versionToken":     "v1",
 		"metadataVersion":  1,
 		"metadataLocation": "s3://" + bucket + "/" + namespace + "/" + tableName + "/metadata/v1.metadata.json",
+		// stored with its metadata, as a create stores it: a table with a location and no
+		// readable metadata is refused a commit rather than given an empty base
 		"metadata": s3tables.TableMetadata{
-			Iceberg: &s3tables.IcebergMetadata{TableUUID: "00000000-0000-0000-0000-000000000001"},
+			Iceberg:      &s3tables.IcebergMetadata{TableUUID: "00000000-0000-0000-0000-000000000001"},
+			FullMetadata: ownedTableMetadata(bucket, namespace, tableName),
 		},
 	}
 	metaBytes, _ := json.Marshal(internal)
@@ -57,6 +61,19 @@ func seedOwnedTable(fc *memFiler, bucket, namespace, tableName, owner string) {
 		IsDirectory: true,
 		Extended:    map[string][]byte{s3tables.ExtendedKeyMetadata: metaBytes},
 	})
+}
+
+// ownedTableMetadata is an empty table's metadata.json at the table's location.
+func ownedTableMetadata(bucket, namespace, tableName string) json.RawMessage {
+	md, err := newTableMetadata(uuid.MustParse("00000000-0000-0000-0000-000000000001"), "s3://"+bucket+"/"+namespace+"/"+tableName, nil, nil, nil, nil)
+	if err != nil {
+		panic(err)
+	}
+	b, err := json.Marshal(md)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
 
 // seedOwnedView registers an existing view owned by owner.

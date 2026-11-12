@@ -406,22 +406,14 @@ func (s *Server) handleRegisterTable(w http.ResponseWriter, r *http.Request) {
 	bucketARN := buildTableBucketARN(bucketName)
 	identityName := s3_constants.GetIdentityNameFromContext(r)
 
-	// Read the existing metadata object before registering, so a bad location
-	// is rejected (400) without leaving a dangling catalog entry.
-	metadataBucket, tablePath, err := parseS3Location(tableLocationFromMetadataLocation(req.MetadataLocation))
-	if err != nil {
+	// The location is checked without reading anything (in the bucket, no
+	// traversal, a file directly in a table's metadata directory), then the
+	// caller's right to create the table and the location's owner, and only
+	// then is anything read: the file read (and, in a mounted bucket, fetched)
+	// on a caller's word would otherwise tell a caller without rights whether a
+	// file exists and is metadata.
+	if _, err := metadataLocationPath(bucketName, req.MetadataLocation); err != nil {
 		writeError(w, http.StatusBadRequest, "BadRequestException", "Invalid metadata-location: "+err.Error())
-		return
-	}
-	// metadata-location is client-supplied; confine the read to the authorized
-	// catalog bucket and reject traversal segments so path.Join in
-	// loadMetadataFile cannot escape into another bucket.
-	if metadataBucket != bucketName {
-		writeError(w, http.StatusBadRequest, "BadRequestException", "metadata-location must be within bucket "+bucketName)
-		return
-	}
-	if !isValidTablePath(tablePath) {
-		writeError(w, http.StatusBadRequest, "BadRequestException", "invalid metadata-location path")
 		return
 	}
 	if authErr := s.authorizeCreateTable(r.Context(), bucketARN, namespace, req.Name, identityName, req.MetadataLocation); authErr != nil {
@@ -429,10 +421,10 @@ func (s *Server) handleRegisterTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	metadataFileName := path.Base(req.MetadataLocation)
 	// A table migrated in has its metadata uploaded through the S3 gateway,
-	// which stores it in chunks rather than inline, so follow the chunks.
-	metadataBytes, err := s.loadTableMetadataBlob(r.Context(), metadataBucket, tablePath, metadataFileName)
+	// which stores it in chunks rather than inline; in a remote-mounted bucket
+	// it may be held only remotely. metadataAtLocation reads both.
+	metadataBytes, err := s.metadataAtLocation(r.Context(), bucketName, req.MetadataLocation)
 	if err != nil {
 		glog.V(1).Infof("Iceberg: RegisterTable load metadata at %s: %v", req.MetadataLocation, err)
 		writeError(w, http.StatusBadRequest, "BadRequestException", "Cannot read metadata at "+req.MetadataLocation)
@@ -441,6 +433,12 @@ func (s *Server) handleRegisterTable(w http.ResponseWriter, r *http.Request) {
 	registered, err := table.ParseMetadataBytes(metadataBytes)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "BadRequestException", fmt.Sprintf("Invalid metadata at %s: %v", req.MetadataLocation, err))
+		return
+	}
+	// the metadata describes the table at this location, not another one: a
+	// file copied from another table names that table's files
+	if want := tableLocationFromMetadataLocation(req.MetadataLocation); strings.TrimSuffix(registered.Location(), "/") != strings.TrimSuffix(want, "/") {
+		writeError(w, http.StatusBadRequest, "BadRequestException", fmt.Sprintf("the metadata's location %s is not %s", registered.Location(), want))
 		return
 	}
 
@@ -567,13 +565,11 @@ func (s *Server) buildLoadTableResult(r *http.Request, getResp s3tables.GetTable
 	}
 	var metadata table.Metadata
 	if len(metadataBytes) > 0 {
+		// metadata that does not parse fails the load: an empty table in its
+		// place reads as no rows, and a writer could commit over it
 		metadata, err = table.ParseMetadataBytes(metadataBytes)
 		if err != nil {
-			glog.Warningf("Iceberg: Failed to parse persisted metadata for %s: %v", tableName, err)
-			// Attempt to reconstruct from IcebergMetadata if available, otherwise synthetic
-			// TODO: Extract schema/spec from getResp.Metadata.Iceberg if FullMetadata fails but partial info exists?
-			// For now, fallback to empty metadata
-			metadata, err = newTableMetadata(tableUUID, location, nil, nil, nil, nil)
+			return LoadTableResult{}, fmt.Errorf("read metadata of %s at %s: %w", tableName, getResp.MetadataLocation, err)
 		}
 	} else {
 		// No full metadata, create synthetic

@@ -81,7 +81,19 @@ func seedMetadataFile(fc *memFiler, tableName, name string, content []byte) stri
 // main on the second, the way the file a table is registered from holds them.
 func seedRegistrableMetadata(t *testing.T, fc *memFiler, tableName string) (string, table.Metadata) {
 	t.Helper()
-	metadata := metadataWithSnapshots(t, []int64{1, 2}, 0)
+	// RegisterTable refuses metadata whose own location is not the table
+	// location it is registered from, so the fixture's location is the table's
+	builder, err := table.MetadataBuilderFromBase(metadataWithSnapshots(t, []int64{1, 2}, 0), "")
+	if err != nil {
+		t.Fatalf("builder: %v", err)
+	}
+	if err := builder.SetLoc("s3://" + registerTestBucket + "/" + path.Join("finance", tableName)); err != nil {
+		t.Fatalf("set location: %v", err)
+	}
+	metadata, err := builder.Build()
+	if err != nil {
+		t.Fatalf("build metadata: %v", err)
+	}
 	content, err := json.Marshal(metadata)
 	if err != nil {
 		t.Fatalf("marshal metadata: %v", err)
@@ -258,6 +270,9 @@ func seedOversizedMetadata(t *testing.T, fc *memFiler, tableName string) (string
 	builder, err := table.MetadataBuilderFromBase(metadataWithSnapshots(t, []int64{1, 2}, 0), "")
 	if err != nil {
 		t.Fatalf("MetadataBuilderFromBase() error = %v", err)
+	}
+	if err := builder.SetLoc("s3://" + registerTestBucket + "/" + path.Join("finance", tableName)); err != nil { // as in seedRegistrableMetadata
+		t.Fatalf("set location: %v", err)
 	}
 	if err := builder.SetProperties(map[string]string{"padding": strings.Repeat("x", s3tables.MaxRequestBodySize)}); err != nil {
 		t.Fatalf("SetProperties() error = %v", err)

@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
@@ -189,57 +191,165 @@ func (s *Server) deleteStagedMetadataFile(ctx context.Context, bucketName, table
 	})
 }
 
+// errEmptyMetadataFile is a metadata file that exists and holds no bytes: a
+// staged create's placeholder is one, and is treated as absent there.
+var errEmptyMetadataFile = errors.New("empty metadata file")
+
+// maxMetadataFileSize bounds a metadata.json read whole into memory (and, for
+// a remote-only file, fetched into the local cluster).
+const maxMetadataFileSize = 64 << 20
+
+// loadMetadataFile reads a file of a table's metadata directory whole: inline
+// content (what the catalog writes), chunks (a file written through the S3
+// gateway or the store's maintenance), or, in a remote-mounted bucket, a file
+// that holds only its RemoteEntry here, fetched into the local cluster first
+// as an S3 read does. A file that holds no bytes is errEmptyMetadataFile.
 func (s *Server) loadMetadataFile(ctx context.Context, bucketName, tablePath, metadataFileName string) ([]byte, error) {
+	content, err := s.readMetadataDirFile(ctx, bucketName, tablePath, metadataFileName, maxMetadataFileSize)
+	if err != nil {
+		return nil, err
+	}
+	if len(content) == 0 {
+		return nil, fmt.Errorf("%s/%s: %w", metadataDirPath(bucketName, tablePath), metadataFileName, errEmptyMetadataFile)
+	}
+	return content, nil
+}
+
+// readMetadataDirFile reads a file of a table's metadata directory whole, at
+// most limit bytes: inline content, chunks, or a remote-only file of a
+// remote-mounted bucket, cached into the local cluster first (its remote size
+// checked against limit before anything is fetched). Reading only inline
+// content, or chunks, returned a remote-only file as empty bytes: in a
+// remote-mounted bucket every file the write-back has uncached is one.
+func (s *Server) readMetadataDirFile(ctx context.Context, bucketName, tablePath, fileName string, limit uint64) ([]byte, error) {
 	opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	metadataDir := metadataDirPath(bucketName, tablePath)
-
-	var content []byte
+	var entry *filer_pb.Entry
 	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 		resp, err := filer_pb.LookupEntry(opCtx, client, &filer_pb.LookupDirectoryEntryRequest{
 			Directory: metadataDir,
-			Name:      metadataFileName,
+			Name:      fileName,
 		})
 		if err != nil {
 			return err
 		}
 		if resp == nil || resp.Entry == nil {
-			return fmt.Errorf("lookup returned nil entry for %s/%s", metadataDir, metadataFileName)
+			return fmt.Errorf("lookup returned nil entry for %s/%s", metadataDir, fileName)
 		}
-		content = append([]byte(nil), resp.Entry.Content...)
+		entry = resp.Entry
+		// a remote file's size is known before it is fetched: one larger than the limit is not fetched at all
+		if remoteOnlyEntry(entry) && uint64(entry.RemoteEntry.RemoteSize) > limit {
+			return fmt.Errorf("%s/%s is %d bytes on the remote, larger than the %d byte limit", metadataDir, fileName, entry.RemoteEntry.RemoteSize, limit)
+		}
+		// one retry in place: a cache call can lose a race with an uncache or a write-back of the same entry
+		for attempt := 0; attempt < 2 && remoteOnlyEntry(entry); attempt++ {
+			cached, err := client.CacheRemoteObjectToLocalCluster(opCtx, &filer_pb.CacheRemoteObjectToLocalClusterRequest{
+				Directory: metadataDir,
+				Name:      fileName,
+			})
+			if err != nil {
+				return fmt.Errorf("cache remote %s/%s: %w", metadataDir, fileName, err)
+			}
+			if cached == nil || cached.Entry == nil {
+				return fmt.Errorf("cache remote %s/%s: no entry returned", metadataDir, fileName)
+			}
+			entry = cached.Entry
+		}
+		if remoteOnlyEntry(entry) {
+			return fmt.Errorf("cache remote %s/%s: still remote-only after caching twice", metadataDir, fileName)
+		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return content, nil
+	if len(entry.Content) > 0 {
+		return append([]byte(nil), entry.Content...), nil
+	}
+	if len(entry.GetChunks()) == 0 {
+		return nil, nil
+	}
+	size := filer.FileSize(entry)
+	if size > limit {
+		return nil, fmt.Errorf("%s/%s is %d bytes, larger than the %d byte limit", metadataDir, fileName, size, limit)
+	}
+	fullClient, ok := s.filerClient.(filer_pb.FilerClient)
+	if !ok {
+		return nil, fmt.Errorf("filer client cannot resolve chunk locations")
+	}
+	var buf bytes.Buffer
+	buf.Grow(int(size))
+	lookup := &lookupFileIDAdapter{fn: filer.LookupFn(fullClient)}
+	if err := filer.StreamContent(lookup, &buf, entry.GetChunks(), 0, int64(size)); err != nil {
+		return nil, fmt.Errorf("read %s/%s: %w", metadataDir, fileName, err)
+	}
+	return buf.Bytes(), nil
+}
+
+// remoteOnlyEntry is a file of a remote-mounted bucket that holds no bytes
+// here: no chunks and no inline content, only its RemoteEntry.
+func remoteOnlyEntry(entry *filer_pb.Entry) bool {
+	return entry.IsInRemoteOnly() && len(entry.Content) == 0
+}
+
+// metadataLocationPath checks a metadata location without reading anything:
+// in bucketName, without traversal segments, and a file directly in a table's
+// metadata directory. It returns the bucket-relative table path.
+func metadataLocationPath(bucketName, metadataLocation string) (string, error) {
+	metadataBucket, tablePath, err := parseS3Location(tableLocationFromMetadataLocation(metadataLocation))
+	if err != nil {
+		return "", fmt.Errorf("invalid metadata location %s: %w", metadataLocation, err)
+	}
+	if err := confineMetadataLocation(metadataBucket, tablePath, bucketName); err != nil {
+		return "", err
+	}
+	// the file itself, directly in the table's metadata directory: a deeper
+	// path would be read as a same-named file there
+	if path.Base(path.Dir(metadataLocation)) != "metadata" {
+		return "", fmt.Errorf("metadata location %s is not a file of a table's metadata directory", metadataLocation)
+	}
+	return tablePath, nil
+}
+
+// metadataAtLocation reads the metadata.json a metadata location names,
+// confined to bucketName (metadataLocationPath).
+func (s *Server) metadataAtLocation(ctx context.Context, bucketName, metadataLocation string) ([]byte, error) {
+	if s.filerClient == nil {
+		return nil, fmt.Errorf("no filer to read %s from", metadataLocation)
+	}
+	tablePath, err := metadataLocationPath(bucketName, metadataLocation)
+	if err != nil {
+		return nil, err
+	}
+	return s.loadMetadataFile(ctx, bucketName, tablePath, path.Base(metadataLocation))
 }
 
 // currentMetadataBytes returns the Iceberg metadata a table serves: the copy
 // kept in its catalog record or, for a record that holds only a metadata
-// location, the file at that location. Tables registered before the record
-// kept their metadata look like that, and serving an empty placeholder for
-// them hides every snapshot and fails every commit on a table UUID mismatch.
-// It returns nil, for the caller's placeholder, when the record has neither
-// or the file is gone.
+// location, the file at that location (metadataAtLocation: confined to the
+// bucket and to a table's metadata directory, chunks followed, a remote-only
+// file of a mounted bucket fetched first). It returns nil, for the caller's
+// placeholder, only when the record has neither: a table created without a
+// location, a new empty table until its first update. A location whose file
+// cannot be read, or is gone, is an error on every path (load, commit,
+// transaction): an empty table in its place reads as no rows, refuses every
+// client commit on a UUID mismatch, and lets a commit without requirements
+// replace the table's history.
+//
+// A catalog-only table (a Lance dataset) has no Iceberg metadata: its
+// record's metadata and location are the Lance client's, never read here, and
+// it is served as an empty read-only Iceberg table.
 func (s *Server) currentMetadataBytes(ctx context.Context, getResp s3tables.GetTableResponse, bucketName string) ([]byte, error) {
+	if s3tables.IsCatalogOnlyFormat(getResp.Format) {
+		return nil, nil
+	}
 	if getResp.Metadata != nil && len(getResp.Metadata.FullMetadata) > 0 {
 		return getResp.Metadata.FullMetadata, nil
 	}
 	if getResp.MetadataLocation == "" {
 		return nil, nil
 	}
-	metadataBucket, tablePath, err := parseS3Location(tableLocationFromMetadataLocation(getResp.MetadataLocation))
-	if err != nil {
-		return nil, err
-	}
-	if err := confineMetadataLocation(metadataBucket, tablePath, bucketName); err != nil {
-		return nil, err
-	}
-	content, err := s.loadTableMetadataBlob(ctx, metadataBucket, tablePath, path.Base(getResp.MetadataLocation))
-	if errors.Is(err, filer_pb.ErrNotFound) {
-		return nil, nil
-	}
-	return content, err
+	return s.metadataAtLocation(ctx, bucketName, getResp.MetadataLocation)
 }

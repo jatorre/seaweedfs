@@ -1,10 +1,12 @@
 package iceberg
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
 )
 
@@ -68,7 +70,17 @@ func TestLoadTableResultOmitsConfigForCredentialVendingClients(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/v1/namespaces/ns/tables/t", nil)
 	r.Header.Set(accessDelegationHeader, "vended-credentials")
 
-	getResp := s3tables.GetTableResponse{MetadataLocation: "s3://bkt/ns/t/metadata/v1.metadata.json"}
+	// stored with its metadata, as a create stores it: a location whose file
+	// cannot be read fails the load (TestBuildLoadTableResultNeverReturnsNilMetadata)
+	md, err := newTableMetadata(uuid.New(), "s3://bkt/ns/t", nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := json.Marshal(md)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getResp := s3tables.GetTableResponse{MetadataLocation: "s3://bkt/ns/t/metadata/v1.metadata.json", Metadata: &s3tables.TableMetadata{FullMetadata: full}}
 	result, err := s.buildLoadTableResult(r, getResp, "bkt", []string{"ns"}, "t")
 	if err != nil {
 		t.Fatalf("buildLoadTableResult() error = %v", err)

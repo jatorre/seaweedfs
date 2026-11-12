@@ -183,6 +183,11 @@ func (s *Server) prepareTableCommit(ctx context.Context, bucketName, bucketARN, 
 			return nil, &icebergRequestError{http.StatusInternalServerError, "InternalServerError", "Failed to build current metadata"}
 		}
 	}
+	// the stored UUID follows the metadata the transaction builds on, not a
+	// record's that disagrees with it
+	if u := currentMetadata.TableUUID(); u != uuid.Nil {
+		tableUUID = u
+	}
 
 	for _, requirement := range requirements {
 		if err := requirement.Validate(currentMetadata); err != nil {

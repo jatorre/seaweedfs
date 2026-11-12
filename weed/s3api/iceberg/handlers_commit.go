@@ -152,7 +152,8 @@ func (s *Server) handleUpdateTable(w http.ResponseWriter, r *http.Request) {
 					}
 					stagedMetadataBytes, loadErr := s.loadMetadataFile(r.Context(), stagedBucket, stagedPath, stagedFileName)
 					if loadErr != nil {
-						if !errors.Is(loadErr, filer_pb.ErrNotFound) {
+						// a staged create's empty placeholder is no template
+						if !errors.Is(loadErr, filer_pb.ErrNotFound) && !errors.Is(loadErr, errEmptyMetadataFile) {
 							writeError(w, http.StatusInternalServerError, "InternalServerError", "Failed to load staged metadata: "+loadErr.Error())
 							return
 						}
@@ -294,6 +295,11 @@ func (s *Server) handleUpdateTable(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, "InternalServerError", "Failed to build current metadata")
 				return
 			}
+		}
+		// the stored UUID follows the metadata the commit builds on, not a
+		// record's that disagrees with it
+		if u := currentMetadata.TableUUID(); u != uuid.Nil {
+			tableUUID = u
 		}
 
 		for _, requirement := range req.Requirements {
