@@ -88,6 +88,7 @@ type S3Options struct {
 	allowUntrustedRemoteEndpoints *bool
 	allowBackslashInKey           *bool
 	iamSelfServiceRequiresGrant   *bool
+	quotaFilerSizeInterval        *time.Duration
 	// shutdownCtx, when non-nil, tells startS3Server to gracefully shut down
 	// its HTTP/gRPC servers once the ctx is cancelled, in addition to on
 	// interrupt. Used by weed mini to orchestrate an ordered shutdown.
@@ -148,6 +149,7 @@ func init() {
 	s3StandaloneOptions.allowUntrustedRemoteEndpoints = cmdS3.Flag.Bool("allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 	s3StandaloneOptions.allowBackslashInKey = cmdS3.Flag.Bool("allowBackslashInKey", false, allowBackslashInKeyUsage)
 	s3StandaloneOptions.iamSelfServiceRequiresGrant = cmdS3.Flag.Bool("iam.selfServiceRequiresGrant", false, iamSelfServiceRequiresGrantUsage)
+	s3StandaloneOptions.quotaFilerSizeInterval = cmdS3.Flag.Duration("quota.filerSizeInterval", defaultQuotaFilerSizeInterval, quotaFilerSizeIntervalUsage)
 }
 
 var cmdS3 = &Command{
@@ -420,6 +422,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		AllowUntrustedRemoteEndpoints: *s3opt.allowUntrustedRemoteEndpoints,
 		AllowBackslashInKey:           *s3opt.allowBackslashInKey,
 		IamSelfServiceRequiresGrant:   *s3opt.iamSelfServiceRequiresGrant,
+		QuotaFilerSizeInterval:        s3opt.resolveQuotaFilerSizeInterval(),
 	})
 	if s3ApiServer_err != nil {
 		glog.Fatalf("S3 API Server startup error: %v", s3ApiServer_err)
@@ -909,3 +912,12 @@ func (v lanceCredentialVendor) VendTableCredentials(ctx context.Context, princip
 // discoverVectorWorkers returns every registered weed-vector address —
 // callers keep their current worker when it is still listed so
 // membership-order changes cannot churn live connections.
+
+// resolveQuotaFilerSizeInterval reads -quota.filerSizeInterval, falling back to
+// its default for options built without the flag (tests, embedders).
+func (s3opt *S3Options) resolveQuotaFilerSizeInterval() time.Duration {
+	if s3opt.quotaFilerSizeInterval == nil {
+		return defaultQuotaFilerSizeInterval
+	}
+	return *s3opt.quotaFilerSizeInterval
+}

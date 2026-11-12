@@ -57,6 +57,12 @@ const iamSelfServiceRequiresGrantUsage = "if true, an identity needs an explicit
 // allowBackslashInKeyUsage documents the S3 flag keeping '\' a literal
 // object-key character instead of normalizing it to '/'. Repeated '//' in a
 // key still collapses: a filer entry name cannot contain an empty segment.
+// quotaFilerSizeIntervalUsage documents the S3 flag bounding how often quota
+// enforcement re-walks a remote-mounted bucket to size it.
+const quotaFilerSizeIntervalUsage = "about how often quota enforcement re-sizes each remote-mounted bucket with a quota from a full filer listing (its local volumes are only a cache); walks run in the background, one bucket at a time, spread over the interval; 0 walks back to back. Other buckets are sized from their collection every pass."
+
+const defaultQuotaFilerSizeInterval = 5 * time.Minute
+
 const allowBackslashInKeyUsage = "treat backslash as a regular object-key character instead of converting it to '/' (aws-compatible; '//' still collapses)"
 
 type FilerOptions struct {
@@ -198,6 +204,7 @@ func init() {
 	filerS3Options.allowUntrustedRemoteEndpoints = cmdFiler.Flag.Bool("s3.allowUntrustedRemoteEndpoints", false, allowUntrustedRemoteEndpointsUsage)
 	filerS3Options.allowBackslashInKey = cmdFiler.Flag.Bool("s3.allowBackslashInKey", false, allowBackslashInKeyUsage)
 	filerS3Options.iamSelfServiceRequiresGrant = cmdFiler.Flag.Bool("s3.iam.selfServiceRequiresGrant", false, iamSelfServiceRequiresGrantUsage)
+	filerS3Options.quotaFilerSizeInterval = cmdFiler.Flag.Duration("s3.quota.filerSizeInterval", defaultQuotaFilerSizeInterval, quotaFilerSizeIntervalUsage)
 
 	// start webdav on filer
 	filerStartWebDav = cmdFiler.Flag.Bool("webdav", false, "whether to start webdav gateway")

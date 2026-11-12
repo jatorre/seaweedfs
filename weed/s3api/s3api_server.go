@@ -87,6 +87,11 @@ type S3ApiServerOption struct {
 	// GetUser) need an explicit iam: grant instead of being allowed to every
 	// authenticated identity.
 	IamSelfServiceRequiresGrant bool
+	// QuotaFilerSizeInterval is about how often quota enforcement's
+	// background sizer re-walks each remote-mounted bucket's filer listing;
+	// 0 walks back to back. Buckets that are not remote-mounted are sized
+	// from their collection on every pass, as before.
+	QuotaFilerSizeInterval time.Duration
 }
 
 // s3ChunkCacheChunkSizeMB is the assumed chunk size (in MiB) used to convert
@@ -141,6 +146,7 @@ type S3ApiServer struct {
 	// ownerIndexReady caches the presence of the owner index backfill marker.
 	ownerIndexReady atomic.Bool
 
+	quotaSizer             *filerQuotaSizer // sizes remote-mounted buckets for the quota loop
 	versionsHealQueue      *versionsHealQueue
 	versionsReconcilerStop func()
 }
